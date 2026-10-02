@@ -322,7 +322,7 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
         );
 
         if let Some(dirty_file) = &dirty_file {
-            dirty_file.punch_hole(page_offset as usize, page.len())?;
+            dirty_file.punch_hole(page_offset, page.len() as u64)?;
         }
         page_states_guard.load_end(page_id as usize, Ok(page));
     }
@@ -623,7 +623,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
 
         // we write to the database only during checkpoint - so we need to punch hole in the dirty file in order to mark this region as valid
         if let Some(dirty_file) = &self.dirty_file {
-            dirty_file.punch_hole(start_pos as usize, buffer_size)?;
+            dirty_file.punch_hole(start_pos, buffer_size as u64)?;
         }
         let end_pos = start_pos + buffer_size as u64;
         let clean_file_size = self.clean_file_size.clone();
@@ -658,11 +658,11 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         let Some(start_pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
-        let buffers_size = buffers.iter().map(|b| b.len()).sum();
+        let buffers_size: usize = buffers.iter().map(|b| b.len()).sum();
         let end_pos = start_pos + buffers_size as u64;
         // we write to the database only during checkpoint - so we need to punch hole in the dirty file in order to mark this region as valid
         if let Some(dirty_file) = &self.dirty_file {
-            dirty_file.punch_hole(start_pos as usize, buffers_size)?;
+            dirty_file.punch_hole(start_pos, buffers_size as u64)?;
         }
         let clean_file_size = self.clean_file_size.clone();
         let nc = Completion::new_write(move |result| match result {

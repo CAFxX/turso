@@ -191,7 +191,7 @@ mod tests {
             self.inner.has_hole(pos, len)
         }
 
-        fn punch_hole(&self, pos: usize, len: usize) -> CoreResult<()> {
+        fn punch_hole(&self, pos: u64, len: u64) -> CoreResult<()> {
             self.inner.punch_hole(pos, len)
         }
     }

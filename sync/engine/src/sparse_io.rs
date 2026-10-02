@@ -145,7 +145,7 @@ impl File for SparseLinuxFile {
         Ok(res as usize >= pos + len)
     }
 
-    fn punch_hole(&self, pos: usize, len: usize) -> turso_core::Result<()> {
+    fn punch_hole(&self, pos: u64, len: u64) -> turso_core::Result<()> {
         let file = self.file.write().unwrap();
         let res = unsafe {
             libc::fallocate(

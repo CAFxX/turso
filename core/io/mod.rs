@@ -208,11 +208,16 @@ pub trait File: Send + Sync {
     fn has_hole(&self, _pos: usize, _len: usize) -> Result<bool> {
         panic!("has_hole is not supported for the given IO implementation")
     }
-    /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
-    /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
-    // todo: need to add custom completion type?
-    fn punch_hole(&self, _pos: usize, _len: usize) -> Result<()> {
-        panic!("punch_hole is not supported for the given IO implementation")
+    /// Deallocate the file-system blocks backing `[pos, pos + len)` without
+    /// changing the file size; subsequent reads of the range return zeroes.
+    /// Used by the pager to release fully freed pages, and by the sync engine
+    /// in partial sync mode.
+    ///
+    /// Backends without hole punching return an `ErrorKind::Unsupported` error
+    /// instead of panicking, so best-effort callers can detect the lack of
+    /// support and continue.
+    fn punch_hole(&self, _pos: u64, _len: u64) -> Result<()> {
+        Err(unsupported_hole_punch())
     }
 
     fn shared_wal_lock_byte(
@@ -399,6 +404,53 @@ impl core::ops::Deref for TempFile {
     }
 }
 
+#[cfg(test)]
+mod punch_hole_tests {
+    use super::*;
+
+    struct PunchHoleDefaultFile {
+        inner: Arc<dyn File>,
+    }
+
+    impl File for PunchHoleDefaultFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    #[test]
+    fn punch_hole_without_backend_support_returns_unsupported_instead_of_panicking() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let inner = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let file = PunchHoleDefaultFile { inner };
+        match file.punch_hole(0, 4096) {
+            Err(crate::LimboError::CompletionError(crate::error::CompletionError::IOError(
+                std::io::ErrorKind::Unsupported,
+                _,
+            ))) => {}
+            other => panic!("expected Unsupported error, got {other:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct OpenFlags(i32);
 
@@ -516,6 +568,93 @@ pub trait IO: Clock + Send + Sync {
                 "failed to get file identity for '{path}': {e}"
             ))
         })
+    }
+}
+
+pub(crate) fn unsupported_hole_punch() -> crate::LimboError {
+    crate::error::io_error(
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "hole punching is not supported by this file",
+        ),
+        "punch_hole",
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn punch_hole_on_fd(fd: std::os::fd::BorrowedFd<'_>, pos: u64, len: u64) -> Result<()> {
+    debug_assert!(len > 0, "hole length must be positive");
+    debug_assert!(
+        pos <= libc::off_t::MAX as u64 && len <= libc::off_t::MAX as u64,
+        "hole range must fit in off_t"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // Retrying on EINTR is safe: deallocating the same range twice is idempotent.
+        let ret = loop {
+            let ret = unsafe {
+                libc::fallocate(
+                    fd.as_raw_fd(),
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    pos as libc::off_t,
+                    len as libc::off_t,
+                )
+            };
+            if ret != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break ret;
+        };
+        if ret == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // EINVAL also means "cannot punch here": deployed filesystems (e.g. GPFS,
+        // per QEMU's fallocate experience) return it for valid ranges they refuse.
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL)
+                | Some(libc::EOPNOTSUPP)
+                | Some(libc::ENOSYS)
+                | Some(libc::EPERM)
+                | Some(libc::EROFS)
+        ) {
+            return Err(unsupported_hole_punch());
+        }
+        Err(crate::error::io_error(error, "fallocate"))
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut range = libc::fpunchhole_t {
+            fp_flags: 0,
+            reserved: 0,
+            fp_offset: pos as libc::off_t,
+            fp_length: len as libc::off_t,
+        };
+        let ret = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_PUNCHHOLE, &mut range) };
+        if ret == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        // The APFS validator reports unsupported ranges (e.g. sub-block) with EINVAL.
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP)
+                | Some(libc::ENOSYS)
+                | Some(libc::EINVAL)
+                | Some(libc::EPERM)
+                | Some(libc::EROFS)
+        ) {
+            return Err(unsupported_hole_punch());
+        }
+        Err(crate::error::io_error(error, "fcntl(F_PUNCHHOLE)"))
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = (fd, pos, len);
+        Err(unsupported_hole_punch())
     }
 }
 

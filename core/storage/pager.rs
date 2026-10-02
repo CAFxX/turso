@@ -1578,6 +1578,7 @@ pub struct SharedPagerState {
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
     page_size: AtomicU32,
+    hole_punch_state: Mutex<HolePunchState>,
 }
 
 impl SharedPagerState {
@@ -1592,6 +1593,7 @@ impl SharedPagerState {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
             page_size: AtomicU32::new(page_size),
+            hole_punch_state: Mutex::new(HolePunchState::default()),
         }
     }
 
@@ -1840,6 +1842,19 @@ enum FreePageState {
     Start,
     AddToTrunk { page: Arc<Page> },
     NewTrunk { page: Arc<Page> },
+}
+
+#[derive(Debug, Default)]
+struct HolePunchRange {
+    start: u64,
+    end: u64,
+    committed_frame: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct HolePunchState {
+    supported: Option<bool>,
+    ranges: Vec<HolePunchRange>,
 }
 
 /// State machine for async cache spilling.
@@ -3405,6 +3420,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             self.clear_savepoints()?;
+            self.flush_hole_punches();
             return Ok(IOResult::Done(()));
         };
 
@@ -4512,6 +4528,13 @@ impl Pager {
 
     pub fn commit_wal_end(&self) {
         self.commit_info.write().reset();
+        match self.wal.as_ref() {
+            Some(wal) => {
+                let frame = wal.get_max_frame_in_wal();
+                self.mark_hole_punch_ranges_committed(frame);
+            }
+            None => self.flush_hole_punches(),
+        }
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -5060,6 +5083,12 @@ impl Pager {
                             wal.vacuum_checkpoint_with_held_lock(self, sync_mode)
                         }
                     });
+                    // SyncMode::Off skips the WAL fsync that makes punching safe:
+                    // without it a crash could persist the hole while the
+                    // freelist update never reaches the disk.
+                    if sync_mode != crate::SyncMode::Off {
+                        self.punch_hole_ranges_up_to(res.wal_total_backfilled);
+                    }
                     let mut state = self.checkpoint_state.write();
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `should_truncate` will be true for successful truncate checkpoint
@@ -5533,6 +5562,7 @@ impl Pager {
 
         let mut state = self.free_page_state.write();
         tracing::debug!(?state);
+        let mut became_freelist_leaf = false;
         loop {
             match &mut *state {
                 FreePageState::Start => {
@@ -5630,6 +5660,7 @@ impl Pager {
 
                         // Unpin page before finishing - it's added to freelist
                         page.unpin();
+                        became_freelist_leaf = true;
                         break;
                     }
                     // page remains pinned as it transitions to NewTrunk state
@@ -5658,7 +5689,174 @@ impl Pager {
             }
         }
         *state = FreePageState::Start;
+        drop(state);
+        if became_freelist_leaf {
+            self.punch_hole_for_empty_page(page_id, header.page_size.get());
+        }
         Ok(IOResult::Done(()))
+    }
+
+    fn hole_punch_disabled(state: &mut HolePunchState) -> bool {
+        if state.supported == Some(false) {
+            state.ranges.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn flush_hole_punches(&self) {
+        let mut state = self.shared.hole_punch_state.lock();
+        if Self::hole_punch_disabled(&mut state) {
+            return;
+        }
+        for range in Self::take_merged_hole_punch_ranges(&mut state) {
+            Self::punch_hole_range(&mut state, &self.db_file, range.start, range.end);
+            if Self::hole_punch_disabled(&mut state) {
+                break;
+            }
+        }
+    }
+
+    fn take_merged_hole_punch_ranges(state: &mut HolePunchState) -> Vec<HolePunchRange> {
+        let mut ranges = std::mem::take(&mut state.ranges);
+        ranges.sort_by_key(|range| range.start);
+        let mut merged: Vec<HolePunchRange> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut() {
+                if range.start <= last.end {
+                    last.end = last.end.max(range.end);
+                    last.committed_frame = match (last.committed_frame, range.committed_frame) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        _ => None,
+                    };
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        merged
+    }
+
+    /// Without checkpoints the queue would grow without bound; dropping entries
+    /// past the cap only forfeits an optimization.
+    const MAX_QUEUED_HOLE_PUNCH_RANGES: usize = 1_000_000;
+
+    fn punch_hole_for_empty_page(&self, page_id: usize, page_size: u32) {
+        let start = (page_id as u64 - 1) * page_size as u64;
+        let end = start + page_size as u64;
+        let mut state = self.shared.hole_punch_state.lock();
+        if state.supported == Some(false)
+            || state.ranges.len() >= Self::MAX_QUEUED_HOLE_PUNCH_RANGES
+        {
+            return;
+        }
+        if let Some(last) = state.ranges.last_mut() {
+            if last.end == start && last.committed_frame.is_none() {
+                last.end = end;
+                return;
+            }
+        }
+        state.ranges.push(HolePunchRange {
+            start,
+            end,
+            committed_frame: None,
+        });
+    }
+
+    fn cancel_hole_punch_page(&self, page_id: usize, page_size: u32) {
+        let page_start = (page_id as u64 - 1) * page_size as u64;
+        let page_end = page_start + page_size as u64;
+        let mut state = self.shared.hole_punch_state.lock();
+        if !state
+            .ranges
+            .iter()
+            .any(|range| range.end > page_start && range.start < page_end)
+        {
+            return;
+        }
+        let mut ranges = Vec::new();
+        for range in std::mem::take(&mut state.ranges) {
+            if range.end <= page_start || range.start >= page_end {
+                ranges.push(range);
+                continue;
+            }
+            if range.start < page_start {
+                ranges.push(HolePunchRange {
+                    start: range.start,
+                    end: page_start,
+                    committed_frame: range.committed_frame,
+                });
+            }
+            if range.end > page_end {
+                ranges.push(HolePunchRange {
+                    start: page_end,
+                    end: range.end,
+                    committed_frame: range.committed_frame,
+                });
+            }
+        }
+        state.ranges = ranges;
+    }
+
+    fn mark_hole_punch_ranges_committed(&self, frame: u64) {
+        let mut state = self.shared.hole_punch_state.lock();
+        if Self::hole_punch_disabled(&mut state) {
+            return;
+        }
+        for range in &mut state.ranges {
+            if range.committed_frame.is_none() {
+                range.committed_frame = Some(frame);
+            }
+        }
+    }
+
+    fn punch_hole_ranges_up_to(&self, frame: u64) {
+        let mut state = self.shared.hole_punch_state.lock();
+        if Self::hole_punch_disabled(&mut state) {
+            return;
+        }
+        let mut remaining = Vec::new();
+        for range in Self::take_merged_hole_punch_ranges(&mut state) {
+            match range.committed_frame {
+                Some(committed_frame) if committed_frame <= frame => {
+                    Self::punch_hole_range(&mut state, &self.db_file, range.start, range.end);
+                    if Self::hole_punch_disabled(&mut state) {
+                        return;
+                    }
+                }
+                _ => remaining.push(range),
+            }
+        }
+        state.ranges = remaining;
+    }
+
+    fn punch_hole_range(
+        state: &mut HolePunchState,
+        db_file: &Arc<dyn DatabaseStorage>,
+        start: u64,
+        end: u64,
+    ) {
+        match db_file.punch_hole(start, end - start) {
+            Ok(()) => {
+                state.supported = Some(true);
+            }
+            Err(error)
+                if matches!(
+                    error,
+                    LimboError::CompletionError(CompletionError::IOError(
+                        std::io::ErrorKind::Unsupported,
+                        _
+                    ))
+                ) =>
+            {
+                state.supported = Some(false);
+                tracing::debug!("hole punching is not supported by the database file: {error}");
+            }
+            Err(error) => {
+                tracing::warn!("hole punching the database file failed: {error}");
+            }
+        }
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -5927,6 +6125,7 @@ impl Pager {
                     leaf_page,
                     number_of_freelist_leaves,
                 } => {
+                    self.cancel_hole_punch_page(leaf_page.get().id(), header.page_size.get());
                     turso_assert!(
                         leaf_page.is_loaded(),
                         "Leaf page is not loaded",
@@ -6112,6 +6311,11 @@ impl Pager {
         self.commit_info.write().reset();
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
+        self.shared
+            .hole_punch_state
+            .lock()
+            .ranges
+            .retain(|range| range.committed_frame.is_some());
         *self.spill_state.write() = SpillState::Idle;
         #[cfg(feature = "autovacuum")]
         {
@@ -6511,9 +6715,9 @@ mod tests {
 
     use crate::sync::RwLock;
 
-    use crate::io::{MemoryIO, OpenFlags, IO};
+    use crate::io::{File, FileSyncType, MemoryIO, OpenFlags, IO};
     use crate::storage::buffer_pool::BufferPool;
-    use crate::storage::database::DatabaseFile;
+    use crate::storage::database::{DatabaseFile, DatabaseStorage};
     use crate::storage::page_cache::{PageCache, PageCacheKey};
     use crate::storage::wal::{Wal, WalFile, WalFileShared};
     use crate::util::IOExt;
@@ -6521,7 +6725,7 @@ mod tests {
     use super::{
         default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
     };
-    use crate::{Buffer, Completion, CompletionError, LimboError};
+    use crate::{Buffer, Completion, CompletionError, IOContext, LimboError, Result};
 
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {
@@ -6705,6 +6909,395 @@ mod tests {
         let page_key = PageCacheKey::new(1);
         let page = cache.get(&page_key).unwrap();
         assert_eq!(page.unwrap().get().id(), 1);
+    }
+
+    fn hole_punch_test_pager() -> (Arc<Pager>, Arc<dyn File>) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = io.open_file("test.db", OpenFlags::Create, true).unwrap();
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file.clone()));
+        let buffer_pool = BufferPool::begin_init(&io, 4096 * 64);
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
+        let pager = Arc::new(
+            Pager::new(db_file, None, io, PageCache::new(64), buffer_pool, shared).unwrap(),
+        );
+        pager.io.block(|| pager.allocate_page1()).unwrap();
+        (pager, file)
+    }
+
+    fn write_pages(file: &Arc<dyn File>, first_page: usize, count: usize) {
+        let buffer = Arc::new(Buffer::new_temporary(count * 4096));
+        let pos = (first_page as u64 - 1) * 4096;
+        let completion = file
+            .pwrite(pos, buffer, Completion::new_write(|_| {}))
+            .unwrap();
+        assert!(completion.succeeded());
+    }
+
+    fn hole_punch_ranges(pager: &Pager) -> Vec<(u64, u64, Option<u64>)> {
+        pager
+            .shared
+            .hole_punch_state
+            .lock()
+            .ranges
+            .iter()
+            .map(|range| (range.start, range.end, range.committed_frame))
+            .collect()
+    }
+
+    #[test]
+    fn hole_punch_queues_ranges_without_punching_before_commit() {
+        let (pager, file) = hole_punch_test_pager();
+        write_pages(&file, 5, 4);
+        pager.punch_hole_for_empty_page(5, 4096);
+        pager.punch_hole_for_empty_page(6, 4096);
+        assert_eq!(hole_punch_ranges(&pager), vec![(4 * 4096, 6 * 4096, None)]);
+        assert!(!file.has_hole(4 * 4096, 2 * 4096).unwrap());
+        pager.punch_hole_for_empty_page(8, 4096);
+        assert_eq!(
+            hole_punch_ranges(&pager),
+            vec![(4 * 4096, 6 * 4096, None), (7 * 4096, 8 * 4096, None)]
+        );
+        assert!(!file.has_hole(4 * 4096, 2 * 4096).unwrap());
+        assert!(!file.has_hole(7 * 4096, 4096).unwrap());
+    }
+
+    #[test]
+    fn free_page_queues_only_freelist_leaf_pages() {
+        let (pager, file) = hole_punch_test_pager();
+        write_pages(&file, 2, 4);
+        for _ in 0..4 {
+            pager.io.block(|| pager.allocate_page()).unwrap();
+        }
+        pager.io.block(|| pager.free_page(None, 2)).unwrap();
+        assert!(hole_punch_ranges(&pager).is_empty());
+        pager.io.block(|| pager.free_page(None, 3)).unwrap();
+        pager.io.block(|| pager.free_page(None, 4)).unwrap();
+        assert_eq!(hole_punch_ranges(&pager), vec![(2 * 4096, 4 * 4096, None)]);
+        assert!(!file.has_hole(2 * 4096, 2 * 4096).unwrap());
+    }
+
+    struct ProbeHolePunchStorage {
+        inner: DatabaseFile,
+        fail_unsupported: bool,
+        punch_attempts: std::sync::atomic::AtomicUsize,
+        punch_calls: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl ProbeHolePunchStorage {
+        fn new(file: Arc<dyn File>, fail_unsupported: bool) -> Self {
+            Self {
+                inner: DatabaseFile::new(file),
+                fail_unsupported,
+                punch_attempts: std::sync::atomic::AtomicUsize::new(0),
+                punch_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DatabaseStorage for ProbeHolePunchStorage {
+        fn read_header(&self, c: Completion) -> Result<Completion> {
+            self.inner.read_header(c)
+        }
+        fn read_page(
+            &self,
+            page_idx: usize,
+            io_ctx: &IOContext,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner.read_page(page_idx, io_ctx, c)
+        }
+        fn write_page(
+            &self,
+            page_idx: usize,
+            buffer: Arc<Buffer>,
+            io_ctx: &IOContext,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner.write_page(page_idx, buffer, io_ctx, c)
+        }
+        fn write_pages(
+            &self,
+            first_page_idx: usize,
+            page_size: usize,
+            buffers: Vec<Arc<Buffer>>,
+            io_ctx: &IOContext,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner
+                .write_pages(first_page_idx, page_size, buffers, io_ctx, c)
+        }
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+        fn punch_hole(&self, pos: u64, len: u64) -> Result<()> {
+            self.punch_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.punch_calls.lock().unwrap().push((pos, len));
+            if self.fail_unsupported {
+                Err(crate::io::unsupported_hole_punch())
+            } else {
+                self.inner.punch_hole(pos, len)
+            }
+        }
+    }
+
+    #[test]
+    fn hole_punch_uncommitted_ranges_discarded_on_rollback() {
+        let (pager, file) = hole_punch_test_pager();
+        write_pages(&file, 2, 4);
+        pager.punch_hole_for_empty_page(3, 4096);
+        pager.punch_hole_for_empty_page(4, 4096);
+        pager.mark_hole_punch_ranges_committed(10);
+        pager.punch_hole_for_empty_page(5, 4096);
+        assert_eq!(hole_punch_ranges(&pager).len(), 2);
+
+        pager.reset_internal_states();
+        assert_eq!(
+            hole_punch_ranges(&pager),
+            vec![(2 * 4096, 4 * 4096, Some(10))]
+        );
+
+        pager.punch_hole_ranges_up_to(10);
+        assert!(file.has_hole(2 * 4096, 2 * 4096).unwrap());
+        assert!(!file.has_hole(4 * 4096, 4096).unwrap());
+    }
+
+    #[test]
+    fn hole_punch_range_excised_on_freelist_leaf_reuse() {
+        let (pager, file) = hole_punch_test_pager();
+        write_pages(&file, 2, 4);
+        for _ in 0..4 {
+            pager.io.block(|| pager.allocate_page()).unwrap();
+        }
+        pager.io.block(|| pager.free_page(None, 2)).unwrap();
+        pager.io.block(|| pager.free_page(None, 3)).unwrap();
+        pager.io.block(|| pager.free_page(None, 4)).unwrap();
+        pager.io.block(|| pager.free_page(None, 5)).unwrap();
+        pager.mark_hole_punch_ranges_committed(7);
+        assert_eq!(
+            hole_punch_ranges(&pager),
+            vec![(2 * 4096, 5 * 4096, Some(7))]
+        );
+
+        let reused = pager.io.block(|| pager.allocate_page()).unwrap();
+        let reused_id = reused.get().id();
+        assert!((3..=5).contains(&reused_id));
+        let reused_start = (reused_id as u64 - 1) * 4096;
+        let ranges = hole_punch_ranges(&pager);
+        assert!(ranges.iter().all(|(_, _, frame)| *frame == Some(7)));
+        assert!(ranges
+            .iter()
+            .all(|(start, end, _)| *end <= reused_start || *start >= reused_start + 4096));
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|(start, end, _)| end - start)
+                .sum::<u64>(),
+            2 * 4096
+        );
+
+        pager.punch_hole_ranges_up_to(7);
+        assert!(!file.has_hole(reused_start as usize, 4096).unwrap());
+        for page_id in [3, 4, 5].into_iter().filter(|id| *id != reused_id) {
+            assert!(file
+                .has_hole((page_id as u64 - 1) as usize * 4096, 4096)
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn hole_punch_unsupported_disables_further_attempts() {
+        use std::sync::atomic::Ordering;
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = io.open_file("test.db", OpenFlags::Create, true).unwrap();
+        let storage = Arc::new(ProbeHolePunchStorage::new(file, true));
+        let db_file: Arc<dyn DatabaseStorage> = storage.clone();
+        let buffer_pool = BufferPool::begin_init(&io, 4096 * 64);
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
+        let pager = Arc::new(
+            Pager::new(db_file, None, io, PageCache::new(64), buffer_pool, shared).unwrap(),
+        );
+        pager.io.block(|| pager.allocate_page1()).unwrap();
+
+        pager.punch_hole_for_empty_page(5, 4096);
+        pager.punch_hole_for_empty_page(6, 4096);
+        pager.mark_hole_punch_ranges_committed(3);
+        pager.punch_hole_ranges_up_to(3);
+        assert_eq!(storage.punch_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(pager.shared.hole_punch_state.lock().supported, Some(false));
+        assert!(hole_punch_ranges(&pager).is_empty());
+
+        pager.punch_hole_for_empty_page(7, 4096);
+        assert!(hole_punch_ranges(&pager).is_empty());
+        pager.punch_hole_ranges_up_to(u64::MAX);
+        assert_eq!(storage.punch_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn commit_wal_end_without_wal_flushes_immediately() {
+        let (pager, file) = hole_punch_test_pager();
+        write_pages(&file, 5, 2);
+        pager.punch_hole_for_empty_page(5, 4096);
+        pager.punch_hole_for_empty_page(6, 4096);
+        pager.commit_wal_end();
+        assert!(file.has_hole(4 * 4096, 2 * 4096).unwrap());
+        assert!(hole_punch_ranges(&pager).is_empty());
+    }
+
+    #[test]
+    fn hole_punch_respects_frame_threshold() {
+        let (pager, file) = hole_punch_test_pager();
+        write_pages(&file, 3, 5);
+        pager.punch_hole_for_empty_page(3, 4096);
+        pager.punch_hole_for_empty_page(4, 4096);
+        pager.mark_hole_punch_ranges_committed(10);
+        pager.punch_hole_for_empty_page(6, 4096);
+        pager.mark_hole_punch_ranges_committed(20);
+
+        pager.punch_hole_ranges_up_to(15);
+        assert!(file.has_hole(2 * 4096, 2 * 4096).unwrap());
+        assert!(!file.has_hole(5 * 4096, 4096).unwrap());
+        assert_eq!(
+            hole_punch_ranges(&pager),
+            vec![(5 * 4096, 6 * 4096, Some(20))]
+        );
+
+        pager.punch_hole_ranges_up_to(20);
+        assert!(file.has_hole(5 * 4096, 4096).unwrap());
+        assert!(hole_punch_ranges(&pager).is_empty());
+    }
+
+    #[test]
+    fn hole_punch_committed_ranges_punched_by_sibling_pager() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = io.open_file("test.db", OpenFlags::Create, true).unwrap();
+        let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file.clone()));
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
+        let pager_a = Arc::new(
+            Pager::new(
+                db_file.clone(),
+                None,
+                io.clone(),
+                PageCache::new(64),
+                BufferPool::begin_init(&io, 4096 * 64),
+                shared.clone(),
+            )
+            .unwrap(),
+        );
+        pager_a.io.block(|| pager_a.allocate_page1()).unwrap();
+        let pager_b = Arc::new(
+            Pager::new(
+                db_file.clone(),
+                None,
+                io.clone(),
+                PageCache::new(64),
+                BufferPool::begin_init(&io, 4096 * 64),
+                shared,
+            )
+            .unwrap(),
+        );
+        write_pages(&file, 5, 2);
+        pager_a.punch_hole_for_empty_page(5, 4096);
+        pager_a.punch_hole_for_empty_page(6, 4096);
+        pager_a.mark_hole_punch_ranges_committed(9);
+        pager_b.punch_hole_ranges_up_to(9);
+        assert!(file.has_hole(4 * 4096, 2 * 4096).unwrap());
+        assert!(hole_punch_ranges(&pager_a).is_empty());
+    }
+
+    #[test]
+    fn hole_punch_batches_contiguous_pages_into_single_call() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = io.open_file("test.db", OpenFlags::Create, true).unwrap();
+        let storage = Arc::new(ProbeHolePunchStorage::new(file, false));
+        let db_file: Arc<dyn DatabaseStorage> = storage.clone();
+        let buffer_pool = BufferPool::begin_init(&io, 4096 * 64);
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
+        let pager = Arc::new(
+            Pager::new(db_file, None, io, PageCache::new(64), buffer_pool, shared).unwrap(),
+        );
+        pager.io.block(|| pager.allocate_page1()).unwrap();
+
+        for page_id in 5..=9 {
+            pager.punch_hole_for_empty_page(page_id, 4096);
+        }
+        pager.punch_hole_for_empty_page(11, 4096);
+        pager.mark_hole_punch_ranges_committed(1);
+        pager.punch_hole_ranges_up_to(1);
+        assert_eq!(
+            *storage.punch_calls.lock().unwrap(),
+            vec![(4 * 4096, 5 * 4096), (10 * 4096, 4096)]
+        );
+        assert!(hole_punch_ranges(&pager).is_empty());
+    }
+
+    struct DefaultHolePunchStorage {
+        inner: DatabaseFile,
+    }
+
+    impl DatabaseStorage for DefaultHolePunchStorage {
+        fn read_header(&self, c: Completion) -> Result<Completion> {
+            self.inner.read_header(c)
+        }
+        fn read_page(
+            &self,
+            page_idx: usize,
+            io_ctx: &IOContext,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner.read_page(page_idx, io_ctx, c)
+        }
+        fn write_page(
+            &self,
+            page_idx: usize,
+            buffer: Arc<Buffer>,
+            io_ctx: &IOContext,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner.write_page(page_idx, buffer, io_ctx, c)
+        }
+        fn write_pages(
+            &self,
+            first_page_idx: usize,
+            page_size: usize,
+            buffers: Vec<Arc<Buffer>>,
+            io_ctx: &IOContext,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner
+                .write_pages(first_page_idx, page_size, buffers, io_ctx, c)
+        }
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+    }
+
+    #[test]
+    fn database_storage_punch_hole_default_is_unsupported() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = io.open_file("test.db", OpenFlags::Create, true).unwrap();
+        let storage = DefaultHolePunchStorage {
+            inner: DatabaseFile::new(file),
+        };
+        match storage.punch_hole(0, 4096) {
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::Unsupported,
+                _,
+            ))) => {}
+            other => panic!("expected Unsupported error, got {other:?}"),
+        }
     }
 }
 

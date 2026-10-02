@@ -251,14 +251,14 @@ impl MemStore {
         true
     }
 
-    pub(super) fn punch_hole(&self, pos: usize, len: usize) {
+    pub(super) fn punch_hole(&self, pos: u64, len: u64) {
         turso_assert!(
-            pos % PAGE_SIZE == 0 && len % PAGE_SIZE == 0,
+            pos % PAGE_SIZE as u64 == 0 && len % PAGE_SIZE as u64 == 0,
             "hole must be page aligned"
         );
         let mut inner = self.inner.write();
-        let start_page = pos / PAGE_SIZE;
-        let end_page = ((pos + len.max(1)) - 1) / PAGE_SIZE;
+        let start_page = (pos / PAGE_SIZE as u64) as usize;
+        let end_page = (((pos + len.max(1)) - 1) / PAGE_SIZE as u64) as usize;
         for page_no in start_page..=end_page {
             inner.pages.remove(&page_no);
         }
@@ -334,7 +334,7 @@ impl File for MemoryFile {
         Ok(self.store.has_hole(pos, len))
     }
 
-    fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+    fn punch_hole(&self, pos: u64, len: u64) -> Result<()> {
         self.store.punch_hole(pos, len);
         Ok(())
     }

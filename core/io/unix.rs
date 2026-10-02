@@ -510,6 +510,15 @@ impl File for UnixFile {
         }
     }
 
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn punch_hole(&self, pos: u64, len: u64) -> Result<()> {
+        super::punch_hole_on_fd(
+            std::os::fd::AsFd::as_fd(&self.file),
+            pos,
+            len,
+        )
+    }
+
     fn shared_wal_lock_byte(
         &self,
         offset: u64,
@@ -608,5 +617,46 @@ mod tests {
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
         assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_punch_hole_zeroes_range_and_keeps_size() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::MetadataExt;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&vec![0xA5u8; 8 * 1024 * 1024]).unwrap();
+        tmp.flush().unwrap();
+        let blocks_before = tmp.as_file().metadata().unwrap().blocks();
+
+        let io = UnixIO::new().unwrap();
+        let file = io
+            .open_file(tmp.path().to_str().unwrap(), OpenFlags::Create, false)
+            .unwrap();
+        match file.punch_hole(4096, 4 * 1024 * 1024) {
+            Ok(()) => {}
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                ErrorKind::Unsupported,
+                _,
+            ))) => {
+                eprintln!("SKIPPED test_punch_hole_zeroes_range_and_keeps_size: hole punching unsupported on this filesystem");
+                return;
+            }
+            Err(e) => panic!("punch_hole failed unexpectedly: {e:?}"),
+        }
+        drop(file);
+
+        let metadata = tmp.as_file().metadata().unwrap();
+        assert_eq!(metadata.len(), 8 * 1024 * 1024);
+        assert!(
+            metadata.blocks() < blocks_before,
+            "punching a 4 MiB hole should free blocks"
+        );
+        let mut check = std::fs::File::open(tmp.path()).unwrap();
+        let mut buf = vec![0u8; 8 * 1024 * 1024];
+        check.read_exact(&mut buf).unwrap();
+        assert!(buf[..4096].iter().all(|&b| b == 0xA5));
+        assert!(buf[4096..4096 + 4 * 1024 * 1024].iter().all(|&b| b == 0));
+        assert!(buf[4096 + 4 * 1024 * 1024..].iter().all(|&b| b == 0xA5));
     }
 }

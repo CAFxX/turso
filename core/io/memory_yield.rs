@@ -201,7 +201,7 @@ impl File for MemoryYieldFile {
         Ok(self.store.has_hole(pos, len))
     }
 
-    fn punch_hole(&self, pos: usize, len: usize) -> Result<()> {
+    fn punch_hole(&self, pos: u64, len: u64) -> Result<()> {
         self.store.punch_hole(pos, len);
         Ok(())
     }

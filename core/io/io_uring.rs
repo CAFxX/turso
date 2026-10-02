@@ -868,6 +868,14 @@ impl File for UringFile {
         }
     }
 
+    fn punch_hole(&self, pos: u64, len: u64) -> Result<()> {
+        super::punch_hole_on_fd(
+            std::os::fd::AsFd::as_fd(&self.file),
+            pos,
+            len,
+        )
+    }
+
     fn shared_wal_lock_byte(
         &self,
         offset: u64,

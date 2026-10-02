@@ -130,6 +130,9 @@ pub trait DatabaseStorage: Send + Sync {
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+    fn punch_hole(&self, _pos: u64, _len: u64) -> Result<()> {
+        Err(crate::io::unsupported_hole_punch())
+    }
 }
 
 #[derive(Clone)]
@@ -356,6 +359,11 @@ impl DatabaseStorage for DatabaseFile {
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion> {
         let c = self.file.truncate(len as u64, c)?;
         Ok(c)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn punch_hole(&self, pos: u64, len: u64) -> Result<()> {
+        self.file.punch_hole(pos, len)
     }
 }
 
